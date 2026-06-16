@@ -73,7 +73,9 @@ async def _get_client() -> OVOEnergy:
         _client = OVOEnergy(client_session=_session)
 
     # Authenticate on first use or when the OAuth token has expired.
-    if getattr(_client, "account_id", None) is None or _client.oauth_expired:
+    # NOTE: `oauth_expired` is safe to read before auth (True when no token);
+    # `account_id` is NOT — it raises OVOEnergyNoAccount when unset.
+    if _client.oauth_expired:
         if not await _client.authenticate(OVO_USERNAME, OVO_PASSWORD):
             raise RuntimeError("OVO authentication failed — check credentials")
         await _client.bootstrap_accounts()
@@ -121,9 +123,18 @@ async def ovo_daily_usage(month: str | None = None) -> dict:
 async def ovo_accounts() -> dict:
     """List the OVO accounts on this login and the active account id."""
     client = await _get_client()
+    try:
+        active_account_id = client.account_id
+    except Exception:
+        active_account_id = None
+    try:
+        customer_id = str(client.customer_id)
+    except Exception:
+        customer_id = None
     return {
-        "active_account_id": getattr(client, "account_id", None),
-        "customer_id": str(getattr(client, "customer_id", "")),
+        "active_account_id": active_account_id,
+        "account_ids": client.account_ids,
+        "customer_id": customer_id,
     }
 
 
