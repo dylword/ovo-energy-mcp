@@ -58,8 +58,13 @@ def _to_dict(obj: Any) -> Any:
     return obj
 
 
-async def _get_client() -> OVOEnergy:
-    """Return an authenticated OVOEnergy client, (re)authenticating as needed."""
+async def _get_client(force: bool = False) -> OVOEnergy:
+    """Return an authenticated OVOEnergy client, (re)authenticating as needed.
+
+    Pass force=True to log in again even if the cached token still *looks* valid
+    by its clock — needed when OVO has invalidated the token server-side (e.g. the
+    account logged in elsewhere), which surfaces as a 401 on an actual request.
+    """
     global _session, _client
 
     if not OVO_USERNAME or not OVO_PASSWORD:
@@ -72,15 +77,37 @@ async def _get_client() -> OVOEnergy:
     if _client is None:
         _client = OVOEnergy(client_session=_session)
 
-    # Authenticate on first use or when the OAuth token has expired.
+    # Authenticate on first use, when the OAuth token has expired, or when forced.
     # NOTE: `oauth_expired` is safe to read before auth (True when no token);
     # `account_id` is NOT — it raises OVOEnergyNoAccount when unset.
-    if _client.oauth_expired:
+    if force or _client.oauth_expired:
         if not await _client.authenticate(OVO_USERNAME, OVO_PASSWORD):
             raise RuntimeError("OVO authentication failed — check credentials")
         await _client.bootstrap_accounts()
 
     return _client
+
+
+def _is_auth_error(exc: BaseException) -> bool:
+    """True if an exception looks like an OVO 401/403 / not-authorized error."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(s in text for s in ("not authorized", "notauthorized", "401", "403"))
+
+
+async def _authed(factory):
+    """Run an OVO call; on a 401/not-authorized, re-login once and retry.
+
+    `factory` is a zero-arg callable returning the coroutine to await (so it can
+    be re-invoked after re-auth). It should read the module-level `_client`.
+    """
+    await _get_client()
+    try:
+        return await factory()
+    except Exception as exc:  # noqa: BLE001 — we re-raise non-auth errors
+        if _is_auth_error(exc):
+            await _get_client(force=True)
+            return await factory()
+        raise
 
 
 def _yesterday() -> str:
@@ -102,9 +129,9 @@ async def ovo_half_hourly_usage(day: str | None = None) -> dict:
         day: Date as YYYY-MM-DD. Defaults to yesterday (latest available — OVO
              data lags ~1 day).
     """
-    client = await _get_client()
-    result = await client.get_half_hourly_usage(day or _yesterday())
-    return {"date": day or _yesterday(), "usage": _to_dict(result)}
+    day = day or _yesterday()
+    result = await _authed(lambda: _client.get_half_hourly_usage(day))
+    return {"date": day, "usage": _to_dict(result)}
 
 
 @mcp.tool()
@@ -114,15 +141,17 @@ async def ovo_daily_usage(month: str | None = None) -> dict:
     Args:
         month: Month as YYYY-MM. Defaults to the current month.
     """
-    client = await _get_client()
-    result = await client.get_daily_usage(month or _this_month())
-    return {"month": month or _this_month(), "usage": _to_dict(result)}
+    month = month or _this_month()
+    result = await _authed(lambda: _client.get_daily_usage(month))
+    return {"month": month, "usage": _to_dict(result)}
 
 
 @mcp.tool()
 async def ovo_accounts() -> dict:
     """List the OVO accounts on this login and the active account id."""
     client = await _get_client()
+    if client.oauth_expired:
+        client = await _get_client(force=True)
     try:
         active_account_id = client.account_id
     except Exception:
@@ -141,15 +170,13 @@ async def ovo_accounts() -> dict:
 @mcp.tool()
 async def ovo_carbon_footprint() -> dict:
     """Carbon footprint data for the account."""
-    client = await _get_client()
-    return _to_dict(await client.get_footprint())
+    return _to_dict(await _authed(lambda: _client.get_footprint()))
 
 
 @mcp.tool()
 async def ovo_carbon_intensity() -> dict:
     """Current grid carbon intensity."""
-    client = await _get_client()
-    return _to_dict(await client.get_carbon_intensity())
+    return _to_dict(await _authed(lambda: _client.get_carbon_intensity()))
 
 
 def _sum_fuel(entries: Any) -> dict:
@@ -193,8 +220,7 @@ async def ovo_spend_summary(month: str | None = None) -> dict:
         month: Month as YYYY-MM. Defaults to the current month.
     """
     month = month or _this_month()
-    client = await _get_client()
-    usage = _to_dict(await client.get_daily_usage(month))
+    usage = _to_dict(await _authed(lambda: _client.get_daily_usage(month)))
 
     electricity = _sum_fuel(usage.get("electricity") if isinstance(usage, dict) else None)
     gas = _sum_fuel(usage.get("gas") if isinstance(usage, dict) else None)
